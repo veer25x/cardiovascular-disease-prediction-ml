@@ -1,0 +1,800 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Cardiovascular Disease (CVD) Risk Prediction\n",
+    "\n",
+    "**Goal:** Compare Decision Tree, Gaussian Naive Bayes, KNN and MLP (ANN) classifiers on the UCI cardio dataset, then deploy the best model with an interpretability layer.\n",
+    "\n",
+    "**Pipeline:**\n",
+    "1. Load & sanity-check data\n",
+    "2. Clean (duplicates, implausible vitals, BMI outliers) & engineer features\n",
+    "3. EDA (boxplots, KDEs, correlation)\n",
+    "4. Train/test split → hyperparameter tuning (GridSearchCV)\n",
+    "5. Cross-validated + hold-out evaluation (Acc, Prec, Rec, F1, AUC)\n",
+    "6. Confusion matrices, ROC curves, paired t-tests\n",
+    "7. Interpretability: Gini importance, permutation importance, tree plot\n",
+    "8. Learning-curve diagnostics (over/under-fitting)\n",
+    "9. Error analysis & model agreement\n",
+    "10. Deploy best model + `predict_patient()` helper\n",
+    "11. Conceptual system architecture\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ------------------------------------------------------------------\n",
+    "# 0. Imports & configuration\n",
+    "# ------------------------------------------------------------------\n",
+    "import warnings; warnings.filterwarnings('ignore')\n",
+    "import os, time\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "import matplotlib.pyplot as plt\n",
+    "import seaborn as sns\n",
+    "import joblib\n",
+    "\n",
+    "from IPython.display import display\n",
+    "from scipy import stats\n",
+    "\n",
+    "from sklearn.model_selection import (\n",
+    "    train_test_split, StratifiedKFold, cross_validate, GridSearchCV\n",
+    ")\n",
+    "from sklearn.preprocessing import StandardScaler\n",
+    "from sklearn.compose import ColumnTransformer\n",
+    "from sklearn.pipeline import Pipeline\n",
+    "from sklearn.tree import DecisionTreeClassifier, plot_tree\n",
+    "from sklearn.naive_bayes import GaussianNB\n",
+    "from sklearn.neighbors import KNeighborsClassifier\n",
+    "from sklearn.neural_network import MLPClassifier\n",
+    "from sklearn.metrics import (\n",
+    "    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,\n",
+    "    confusion_matrix, ConfusionMatrixDisplay, roc_curve\n",
+    ")\n",
+    "from sklearn.inspection import permutation_importance\n",
+    "\n",
+    "sns.set_theme(style='whitegrid')\n",
+    "\n",
+    "# ---- Configuration ----\n",
+    "RS            = 42\n",
+    "TEST_SIZE     = 0.20\n",
+    "SUBSAMPLE     = 15_000   # rows used for KNN / MLP tuning (speed)\n",
+    "PERM_SAMPLE   = 3_000    # rows used for permutation importance\n",
+    "FIG_DIR       = 'figures'\n",
+    "os.makedirs(FIG_DIR, exist_ok=True)\n",
+    "\n",
+    "def save(fig, name):\n",
+    "    \"\"\"Save a figure and show it.\"\"\"\n",
+    "    fig.savefig(os.path.join(FIG_DIR, name), dpi=130, bbox_inches='tight')\n",
+    "    plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Load data & initial sanity check\n",
+    "\n",
+    "The dataset uses `;` as separator and has a row ID we drop. Expected: 70 000 rows, 12 features + target."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df = pd.read_csv('cardio_train.csv', sep=';').drop(columns='id')\n",
+    "print(f'Shape: {df.shape}')\n",
+    "print(f'Missing values: {df.isna().sum().sum()}')\n",
+    "print(f'Duplicate rows: {df.duplicated().sum()}')\n",
+    "display(df.head())\n",
+    "display(df.describe().T)\n",
+    "\n",
+    "# Class balance\n",
+    "print('\\nClass balance (target=cardio):')\n",
+    "print(df.cardio.value_counts(normalize=True).round(3))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Cleaning & feature engineering\n",
+    "\n",
+    "**Rules applied**\n",
+    "- Drop exact duplicates.\n",
+    "- Convert `age` (days) → `age_years`.\n",
+    "- Drop physiologically implausible vitals:\n",
+    "  - `70 ≤ ap_hi ≤ 250`, `40 ≤ ap_lo ≤ 200`, `ap_hi > ap_lo`\n",
+    "  - `130 ≤ height ≤ 220`, `35 ≤ weight ≤ 200`\n",
+    "- Derive `BMI` and `pulse_pressure`.\n",
+    "- Re-encode `gender` as male=1.\n",
+    "- One-hot encode `cholesterol` and `gluc` (useful for distance/probability models).\n",
+    "- Drop BMI outliers (12 – 60).\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "d = df.copy()\n",
+    "\n",
+    "# Drop duplicates\n",
+    "n0 = len(d)\n",
+    "d  = d.drop_duplicates()\n",
+    "print(f'Duplicates removed: {n0 - len(d)}')\n",
+    "\n",
+    "# Age in years\n",
+    "d['age_years'] = (d.age / 365.25).round(1)\n",
+    "\n",
+    "# Physiologically plausible vitals\n",
+    "mask = (\n",
+    "    d.ap_hi.between(70, 250) & d.ap_lo.between(40, 200) & (d.ap_hi > d.ap_lo)\n",
+    "    & d.height.between(130, 220) & d.weight.between(35, 200)\n",
+    ")\n",
+    "print(f'Implausible rows removed: {len(d) - mask.sum()} of {len(d)}')\n",
+    "d = d[mask].reset_index(drop=True)\n",
+    "print('Clean shape:', d.shape)\n",
+    "\n",
+    "# ---- Visual check after cleaning ----\n",
+    "fig, axes = plt.subplots(1, 4, figsize=(16, 3.2))\n",
+    "for ax, col in zip(axes, ['age_years', 'ap_hi', 'ap_lo', 'weight']):\n",
+    "    sns.boxplot(x=d[col], ax=ax, color='steelblue')\n",
+    "    ax.set_title(col)\n",
+    "plt.tight_layout()\n",
+    "save(plt.gcf(), '01_boxplots_clean.png')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ---- Feature engineering ----\n",
+    "d['bmi']            = d.weight / (d.height / 100) ** 2\n",
+    "d['pulse_pressure'] = d.ap_hi - d.ap_lo\n",
+    "d['gender']         = (d.gender == 2).astype(int)      # 1 = male\n",
+    "d = d.drop(columns=['age'])\n",
+    "\n",
+    "# BMI plausibility filter\n",
+    "d = d[d.bmi.between(12, 60)].reset_index(drop=True)\n",
+    "\n",
+    "# One-hot for ordinal risk levels\n",
+    "d = pd.get_dummies(d, columns=['cholesterol', 'gluc'],\n",
+    "                   prefix=['chol', 'gluc'], dtype=int)\n",
+    "\n",
+    "X, y = d.drop(columns='cardio'), d.cardio\n",
+    "print('Feature matrix:', X.shape)\n",
+    "print(list(X.columns))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Exploratory data analysis\n",
+    "\n",
+    "- **KDE plots** show how each risk factor separates the two classes.\n",
+    "- **Correlation heatmap** reveals collinearity (expected between `weight`, `bmi`, `ap_hi`)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "fig, axes = plt.subplots(2, 3, figsize=(16, 8))\n",
+    "for ax, col in zip(axes.flat,\n",
+    "                   ['age_years', 'ap_hi', 'bmi', 'weight', 'pulse_pressure', 'ap_lo']):\n",
+    "    sns.kdeplot(data=d, x=col, hue='cardio', fill=True,\n",
+    "                common_norm=False, ax=ax, palette=['#2a9d8f', '#e63946'])\n",
+    "    ax.set_title(col)\n",
+    "plt.tight_layout()\n",
+    "save(plt.gcf(), '02_kde_risk_factors.png')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "fig, axes = plt.subplots(1, 2, figsize=(16, 6))\n",
+    "corr = pd.concat([X, y], axis=1).corr()\n",
+    "sns.heatmap(corr, cmap='coolwarm', center=0, ax=axes[0], cbar=False)\n",
+    "axes[0].set_title('Correlation matrix')\n",
+    "corr['cardio'].drop('cardio').sort_values().plot.barh(ax=axes[1], color='steelblue')\n",
+    "axes[1].set_title('Correlation with cardio')\n",
+    "plt.tight_layout()\n",
+    "save(plt.gcf(), '03_correlation.png')\n",
+    "\n",
+    "# Risk by age band\n",
+    "print('\\nCVD prevalence by age band:')\n",
+    "print(d.groupby(pd.cut(d.age_years, [28, 40, 50, 55, 60, 66]))['cardio'].mean().round(3))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 4. Train / test split & preprocessing pipeline\n",
+    "\n",
+    "`StandardScaler` is applied only to continuous features — tree models don't need it, but pipelines keep evaluation fair. KNN and MLP **require** it."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "Xtr, Xte, ytr, yte = train_test_split(\n",
+    "    X, y, test_size=TEST_SIZE, stratify=y, random_state=RS\n",
+    ")\n",
+    "print(f'Train: {Xtr.shape}  |  Test: {Xte.shape}')\n",
+    "\n",
+    "CONT = ['age_years', 'height', 'weight', 'ap_hi', 'ap_lo', 'bmi', 'pulse_pressure']\n",
+    "\n",
+    "def prep():\n",
+    "    return ColumnTransformer(\n",
+    "        [('scale', StandardScaler(), CONT)], remainder='passthrough'\n",
+    "    )\n",
+    "\n",
+    "cv5 = StratifiedKFold(5, shuffle=True, random_state=RS)\n",
+    "cv3 = StratifiedKFold(3, shuffle=True, random_state=RS)\n",
+    "\n",
+    "# Subsample for expensive models (KNN, MLP)\n",
+    "sub_idx = Xtr.sample(SUBSAMPLE, random_state=RS).index\n",
+    "Xs, ys  = Xtr.loc[sub_idx], ytr.loc[sub_idx]"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 5. Hyperparameter tuning\n",
+    "\n",
+    "GridSearchCV optimised on **F1** (screening task: we prefer balancing precision/recall over raw accuracy, since CVD is relatively balanced but false negatives are costly).\n",
+    "\n",
+    "| Model | Search space |\n",
+    "|---|---|\n",
+    "| Decision Tree | `max_depth`, `min_samples_leaf`, `criterion` |\n",
+    "| Naive Bayes | `var_smoothing` |\n",
+    "| KNN | `n_neighbors`, `weights` |\n",
+    "| MLP | `hidden_layer_sizes`, `alpha`, `learning_rate_init` |\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "grids = {\n",
+    "    'Decision Tree': (\n",
+    "        Pipeline([('p', prep()),\n",
+    "                  ('m', DecisionTreeClassifier(random_state=RS))]),\n",
+    "        {'m__max_depth': [3, 4, 5, 6, 8, 10],\n",
+    "         'm__min_samples_leaf': [20, 50, 100],\n",
+    "         'm__criterion': ['gini', 'entropy']},\n",
+    "        (Xtr, ytr), cv5),\n",
+    "    'Naive Bayes': (\n",
+    "        Pipeline([('p', prep()),\n",
+    "                  ('m', GaussianNB())]),\n",
+    "        {'m__var_smoothing': [1e-9, 1e-7, 1e-5, 1e-3, 1e-1]},\n",
+    "        (Xtr, ytr), cv5),\n",
+    "    'KNN': (\n",
+    "        Pipeline([('p', prep()),\n",
+    "                  ('m', KNeighborsClassifier(n_jobs=-1))]),\n",
+    "        {'m__n_neighbors': [5, 15, 31, 51, 81],\n",
+    "         'm__weights': ['uniform', 'distance']},\n",
+    "        (Xs, ys), cv3),\n",
+    "    'ANN (MLP)': (\n",
+    "        Pipeline([('p', prep()),\n",
+    "                  ('m', MLPClassifier(early_stopping=True,\n",
+    "                                      max_iter=300,\n",
+    "                                      random_state=RS))]),\n",
+    "        {'m__hidden_layer_sizes': [(32,), (64, 32)],\n",
+    "         'm__alpha': [1e-4, 1e-2],\n",
+    "         'm__learning_rate_init': [1e-3]},\n",
+    "        (Xs, ys), cv3),\n",
+    "}\n",
+    "\n",
+    "best, tune_log = {}, []\n",
+    "for name, (pipe, grid, (Xg, yg), cvx) in grids.items():\n",
+    "    t  = time.time()\n",
+    "    gs = GridSearchCV(pipe, grid, scoring='f1', cv=cvx, n_jobs=1).fit(Xg, yg)\n",
+    "    est = gs.best_estimator_.fit(Xtr, ytr)      # refit on full train\n",
+    "    best[name] = est\n",
+    "    tune_log.append((name, gs.best_params_, round(gs.best_score_, 4),\n",
+    "                     round(time.time() - t, 1)))\n",
+    "    print(f'{name:14s} CV-F1={gs.best_score_:.4f}  {gs.best_params_}  ({time.time()-t:.0f}s)')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 6. Cross-validated performance (5-fold)\n",
+    "\n",
+    "Also run the tuned models through 5-fold CV to obtain **confidence intervals** (mean ± std) before comparing on hold-out."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "SCORING = ['accuracy', 'precision', 'recall', 'f1', 'roc_auc']\n",
+    "rows = []\n",
+    "for name, est in best.items():\n",
+    "    r = cross_validate(est, Xtr, ytr, cv=cv5, scoring=SCORING, n_jobs=1)\n",
+    "    rows.append({\n",
+    "        'Model': name,\n",
+    "        **{m.upper() if m == 'roc_auc' else m.capitalize():\n",
+    "           f\"{r['test_'+m].mean():.4f} ± {r['test_'+m].std():.4f}\"\n",
+    "           for m in SCORING}\n",
+    "    })\n",
+    "cv_df = pd.DataFrame(rows).set_index('Model')\n",
+    "display(cv_df)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 7. Hold-out test evaluation"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "res, preds, probs = [], {}, {}\n",
+    "for name, est in best.items():\n",
+    "    p  = est.predict(Xte)\n",
+    "    pr = est.predict_proba(Xte)[:, 1]\n",
+    "    preds[name], probs[name] = p, pr\n",
+    "    res.append({'Model': name,\n",
+    "                'Accuracy' : accuracy_score(yte, p),\n",
+    "                'Precision': precision_score(yte, p),\n",
+    "                'Recall'   : recall_score(yte, p),\n",
+    "                'F1'       : f1_score(yte, p),\n",
+    "                'ROC-AUC'  : roc_auc_score(yte, pr)})\n",
+    "\n",
+    "res_df = pd.DataFrame(res).set_index('Model').round(4)\n",
+    "display(res_df.style.highlight_max(color='#b7e4c7'))\n",
+    "res_df.to_csv('test_metrics.csv')\n",
+    "\n",
+    "res_df.plot.bar(figsize=(11, 4.5), rot=0, colormap='viridis', ylim=(0.5, 0.85))\n",
+    "plt.title('Hold-out test performance')\n",
+    "plt.legend(loc='lower right', ncol=5)\n",
+    "plt.tight_layout()\n",
+    "save(plt.gcf(), '04_metric_comparison.png')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "fig, axes = plt.subplots(1, 4, figsize=(20, 4.5))\n",
+    "for ax, (name, p) in zip(axes, preds.items()):\n",
+    "    ConfusionMatrixDisplay(confusion_matrix(yte, p),\n",
+    "                           display_labels=['No CVD', 'CVD']) \\\n",
+    "        .plot(ax=ax, cmap='Blues', colorbar=False, values_format='d')\n",
+    "    ax.set_title(name)\n",
+    "plt.tight_layout()\n",
+    "save(plt.gcf(), '05_confusion_matrices.png')\n",
+    "\n",
+    "for name, p in preds.items():\n",
+    "    tn, fp, fn, tp = confusion_matrix(yte, p).ravel()\n",
+    "    print(f'{name:14s} TN={tn} FP={fp} FN={fn} TP={tp} | '\n",
+    "          f'Specificity={tn/(tn+fp):.3f}  Sensitivity={tp/(tp+fn):.3f}')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "plt.figure(figsize=(6.5, 5.5))\n",
+    "for name, pr in probs.items():\n",
+    "    f, t, _ = roc_curve(yte, pr)\n",
+    "    plt.plot(f, t, label=f'{name} (AUC={roc_auc_score(yte, pr):.3f})')\n",
+    "plt.plot([0, 1], [0, 1], 'k--', alpha=0.4)\n",
+    "plt.xlabel('False Positive Rate'); plt.ylabel('True Positive Rate')\n",
+    "plt.title('ROC curves')\n",
+    "plt.legend(); plt.tight_layout()\n",
+    "save(plt.gcf(), '06_roc.png')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 8. Statistical model comparison\n",
+    "\n",
+    "Paired t-tests on 5-fold F1 scores, comparing the best model against each alternative."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "cvF1 = {\n",
+    "    n: cross_validate(e, Xtr, ytr, cv=cv5, scoring='f1')['test_score']\n",
+    "    for n, e in best.items()\n",
+    "}\n",
+    "top = max(cvF1, key=lambda k: cvF1[k].mean())\n",
+    "print(f'Best CV model: {top}\\n')\n",
+    "for n, s in cvF1.items():\n",
+    "    if n != top:\n",
+    "        p = stats.ttest_rel(cvF1[top], s).pvalue\n",
+    "        print(f'{top} vs {n}: mean diff={cvF1[top].mean()-s.mean():+.4f}  p={p:.4f}')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 9. Interpretability\n",
+    "\n",
+    "### 9a. Decision-tree native (Gini) importance\n",
+    "### 9b. Permutation importance across all models (model-agnostic)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "dt    = best['Decision Tree']\n",
+    "names = CONT + [c for c in X.columns if c not in CONT]\n",
+    "imp   = pd.Series(dt.named_steps['m'].feature_importances_, index=names) \\\n",
+    "          .sort_values()\n",
+    "imp.tail(10).plot.barh(figsize=(7, 4.5), color='#e63946')\n",
+    "plt.title('Decision Tree — Gini importance (top 10)')\n",
+    "plt.tight_layout()\n",
+    "save(plt.gcf(), '07_dt_importance.png')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Single sample used by every model (fixed seed!)\n",
+    "sample_idx = Xte.sample(PERM_SAMPLE, random_state=RS).index\n",
+    "Xp, yp = Xte.loc[sample_idx], yte.loc[sample_idx]\n",
+    "\n",
+    "perm = {}\n",
+    "for name, est in best.items():\n",
+    "    r = permutation_importance(est, Xp, yp, scoring='f1',\n",
+    "                               n_repeats=5, random_state=RS, n_jobs=1)\n",
+    "    perm[name] = pd.Series(r.importances_mean, index=X.columns)\n",
+    "\n",
+    "perm_df = pd.DataFrame(perm)\n",
+    "top10   = perm_df.loc[perm_df.mean(axis=1)\n",
+    "                    .sort_values(ascending=False).head(10).index]\n",
+    "display(top10.round(4))\n",
+    "\n",
+    "top10.iloc[::-1].plot.barh(figsize=(9, 6))\n",
+    "plt.xlabel('Mean F1 drop when feature shuffled')\n",
+    "plt.title('Permutation importance — all models (top 10 by mean)')\n",
+    "plt.tight_layout()\n",
+    "save(plt.gcf(), '08_perm_importance.png')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "plt.figure(figsize=(20, 7))\n",
+    "plot_tree(dt.named_steps['m'], feature_names=names,\n",
+    "          class_names=['No CVD', 'CVD'], max_depth=3,\n",
+    "          filled=True, rounded=True, fontsize=8)\n",
+    "plt.title('Decision Tree (top 3 levels) — interpretable clinical rules')\n",
+    "save(plt.gcf(), '09_tree.png')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 10. Over-/under-fitting diagnostics\n",
+    "\n",
+    "- **Decision tree:** F1 vs `max_depth` (train vs test) → shows where variance explodes.\n",
+    "- **KNN:** F1 vs `k` → shows the bias/variance trade-off.\n",
+    "- **MLP:** train loss + validation error per epoch."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Decision-tree depth sweep\n",
+    "ds = range(1, 21); tr, te = [], []\n",
+    "for k in ds:\n",
+    "    m = Pipeline([('p', prep()),\n",
+    "                  ('m', DecisionTreeClassifier(max_depth=k,\n",
+    "                                               min_samples_leaf=20,\n",
+    "                                               random_state=RS))]).fit(Xtr, ytr)\n",
+    "    tr.append(f1_score(ytr, m.predict(Xtr)))\n",
+    "    te.append(f1_score(yte, m.predict(Xte)))\n",
+    "\n",
+    "# KNN k sweep\n",
+    "ks = [1, 3, 5, 11, 21, 41, 61, 101]; ktr, kte = [], []\n",
+    "for k in ks:\n",
+    "    m = Pipeline([('p', prep()),\n",
+    "                  ('m', KNeighborsClassifier(k, n_jobs=-1))]).fit(Xs, ys)\n",
+    "    ktr.append(f1_score(ys, m.predict(Xs)))\n",
+    "    kte.append(f1_score(yte, m.predict(Xte)))\n",
+    "\n",
+    "# Plot\n",
+    "fig, axes = plt.subplots(1, 3, figsize=(17, 4))\n",
+    "axes[0].plot(ds, tr, label='train'); axes[0].plot(ds, te, label='test')\n",
+    "axes[0].set_title('Decision Tree: depth vs F1')\n",
+    "axes[0].set_xlabel('max_depth'); axes[0].legend()\n",
+    "\n",
+    "axes[1].plot(ks, ktr, label='train'); axes[1].plot(ks, kte, label='test')\n",
+    "axes[1].set_title('KNN: k vs F1')\n",
+    "axes[1].set_xlabel('k'); axes[1].legend()\n",
+    "\n",
+    "mlp = best['ANN (MLP)'].named_steps['m']\n",
+    "axes[2].plot(mlp.loss_curve_, label='train loss')\n",
+    "axes[2].plot(1 - np.array(mlp.validation_scores_), label='val error')\n",
+    "axes[2].set_title('ANN training curves')\n",
+    "axes[2].set_xlabel('epoch'); axes[2].legend()\n",
+    "\n",
+    "plt.tight_layout()\n",
+    "save(plt.gcf(), '10_behaviour.png')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 11. Inference timing & error analysis\n",
+    "\n",
+    "- **Timing:** training time + prediction time on the hold-out set.\n",
+    "- **Error profile:** mean feature values for FP / FN / correct.\n",
+    "- **Model agreement:** correlation of hard predictions."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "tm = []\n",
+    "for name, est in best.items():\n",
+    "    t = time.time(); est.fit(Xtr, ytr);              ft = time.time() - t\n",
+    "    t = time.time(); est.predict(Xte);               pt = time.time() - t\n",
+    "    tm.append({'Model': name,\n",
+    "               'Train (s)': round(ft, 2),\n",
+    "               'Predict (s)': round(pt, 3)})\n",
+    "display(pd.DataFrame(tm).set_index('Model'))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "bn  = max(res_df.F1.items(), key=lambda kv: kv[1])[0]\n",
+    "print('Best model by test F1:', bn)\n",
+    "\n",
+    "err = Xte.copy()\n",
+    "err['y']    = yte\n",
+    "err['pred'] = preds[bn]\n",
+    "err['prob'] = probs[bn]\n",
+    "err['kind'] = np.select(\n",
+    "    [(err.y == 1) & (err.pred == 0), (err.y == 0) & (err.pred == 1)],\n",
+    "    ['False Negative', 'False Positive'], 'Correct'\n",
+    ")\n",
+    "display(err.groupby('kind')[['age_years', 'ap_hi', 'ap_lo', 'bmi', 'prob']]\n",
+    "          .mean().round(2))\n",
+    "\n",
+    "print('\\nPairwise prediction agreement:')\n",
+    "display(pd.DataFrame(preds).corr().round(3))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 12. Model strengths / weaknesses summary"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "sw = pd.DataFrame({\n",
+    "    'Strengths': [\n",
+    "        'Human-readable rules; no scaling needed; fast inference; native importance',\n",
+    "        'Very fast; few parameters; probabilistic output; robust baseline',\n",
+    "        'No training phase; captures local patterns; case-based explainability',\n",
+    "        'Captures non-linear interactions; strong generalisation; probabilistic output'\n",
+    "    ],\n",
+    "    'Weaknesses': [\n",
+    "        'High variance / overfits when deep; axis-aligned splits',\n",
+    "        'Assumes conditional independence & Gaussian features — violated by BP/BMI',\n",
+    "        'Slow prediction; sensitive to scaling & choice of k',\n",
+    "        'Black box; many hyper-parameters; needs scaling; longer training'\n",
+    "    ],\n",
+    "    'Healthcare fit': [\n",
+    "        'Best for explainable triage rules',\n",
+    "        'Good lightweight screening baseline',\n",
+    "        'Useful for case-based reasoning; poor for real-time at scale',\n",
+    "        'Best when accuracy matters + explainability layer (SHAP)'\n",
+    "    ]},\n",
+    "    index=['Decision Tree', 'Naive Bayes', 'KNN', 'ANN (MLP)'])\n",
+    "pd.set_option('display.max_colwidth', 200)\n",
+    "display(sw)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 13. Deploy best model + `predict_patient()` helper\n",
+    "\n",
+    "Saves a single `.joblib` artefact that stores model, feature list, and model name so downstream code stays consistent with training."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "final_name = res_df.F1.idxmax()\n",
+    "final      = best[final_name]\n",
+    "print('Deployed model:', final_name)\n",
+    "\n",
+    "joblib.dump({'model'   : final,\n",
+    "             'features': list(X.columns),\n",
+    "             'name'    : final_name},\n",
+    "            'cvd_model.joblib')\n",
+    "\n",
+    "def predict_patient(age_years, gender, height, weight, ap_hi, ap_lo,\n",
+    "                    cholesterol, gluc, smoke, alco, active, model=final):\n",
+    "    \"\"\"Return risk probability, band and advice for one patient.\"\"\"\n",
+    "    r = dict(age_years=age_years, gender=int(gender == 'male'),\n",
+    "             height=height, weight=weight, ap_hi=ap_hi, ap_lo=ap_lo,\n",
+    "             smoke=smoke, alco=alco, active=active,\n",
+    "             bmi=weight / (height / 100) ** 2,\n",
+    "             pulse_pressure=ap_hi - ap_lo)\n",
+    "    for k in (1, 2, 3):\n",
+    "        r[f'chol_{k}'] = int(cholesterol == k)\n",
+    "        r[f'gluc_{k}'] = int(gluc == k)\n",
+    "    x = pd.DataFrame([r])[X.columns]\n",
+    "    p = model.predict_proba(x)[0, 1]\n",
+    "    band = 'LOW' if p < 0.35 else 'MODERATE' if p < 0.60 else 'HIGH'\n",
+    "    advice = {\n",
+    "        'LOW'     : 'Routine annual check-up',\n",
+    "        'MODERATE': 'Lifestyle review + follow-up BP/lipid test',\n",
+    "        'HIGH'    : 'Refer for clinical cardiology assessment'\n",
+    "    }[band]\n",
+    "    return {'risk_probability': round(float(p), 3),\n",
+    "            'risk_band'       : band,\n",
+    "            'advice'          : advice}\n",
+    "\n",
+    "# Example patients\n",
+    "print(predict_patient(58, 'male',   170, 92, 150, 95, 3, 1, 1, 0, 0))\n",
+    "print(predict_patient(35, 'female', 165, 58, 115, 75, 1, 1, 0, 0, 1))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 14. Conceptual system architecture\n",
+    "\n",
+    "Data flow from clinic/EHR → validation → model → clinician dashboard → feedback loop."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import matplotlib.patches as mp\n",
+    "\n",
+    "fig, ax = plt.subplots(figsize=(15, 4.2)); ax.axis('off')\n",
+    "steps = [\n",
+    "    ('Patient data\\n(EHR / clinic form)',        '#a8dadc'),\n",
+    "    ('Validation &\\ncleaning rules',             '#bde0fe'),\n",
+    "    ('Feature engineering\\n+ scaling',           '#cdb4db'),\n",
+    "    (f'{final_name}\\nclassifier',                '#ffafcc'),\n",
+    "    ('Risk score +\\nband (Low/Mod/High)',        '#ffd6a5'),\n",
+    "    ('Clinician dashboard\\n+ explanation',       '#caffbf'),\n",
+    "    ('Feedback &\\nretraining loop',              '#fdffb6'),\n",
+    "]\n",
+    "for i, (t, c) in enumerate(steps):\n",
+    "    ax.add_patch(mp.FancyBboxPatch((i*2.1, 0.3), 1.8, 1.4,\n",
+    "                                   boxstyle='round,pad=0.05', fc=c, ec='k'))\n",
+    "    ax.text(i*2.1 + 0.9, 1.0, t, ha='center', va='center', fontsize=9)\n",
+    "    if i < len(steps) - 1:\n",
+    "        ax.annotate('', xy=((i+1)*2.1 - 0.02, 1.0),\n",
+    "                    xytext=(i*2.1 + 1.86, 1.0),\n",
+    "                    arrowprops=dict(arrowstyle='->'))\n",
+    "ax.set_xlim(-0.2, 14.8); ax.set_ylim(0, 2)\n",
+    "plt.title('Conceptual architecture: AI cardiovascular risk screening system')\n",
+    "plt.tight_layout()\n",
+    "save(plt.gcf(), '11_system_architecture.png')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 15. Final summary\n",
+    "\n",
+    "Print the final hold-out metrics table, identify the best model by F1, and list the top-5 drivers."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "print('=== FINAL TEST RESULTS ===')\n",
+    "display(res_df)\n",
+    "\n",
+    "b = res_df.F1.idxmax()\n",
+    "print(f'\\nBest model by F1: {b}  '\n",
+    "      f'(F1={res_df.F1.max():.4f}, '\n",
+    "      f'Acc={res_df.loc[b, \"Accuracy\"]:.4f}, '\n",
+    "      f'AUC={res_df.loc[b, \"ROC-AUC\"]:.4f})')\n",
+    "\n",
+    "top5 = perm_df.mean(axis=1).sort_values(ascending=False).head(5).index\n",
+    "print('Top drivers (mean permutation importance):', ', '.join(top5))"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python",
+   "version": "3.10"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
